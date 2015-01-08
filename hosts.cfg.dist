@@ -1,0 +1,6 @@
+
+# List of hosts to connect to
+
+name=core-router,ip=10.10.10.10,user=root,password=verysecret,type=cisco
+name=core-switch,ip=10.10.10.11,user=root,password=verysecret,type=cisco
+

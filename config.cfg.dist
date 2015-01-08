@@ -1,0 +1,7 @@
+#
+# Email report settings
+#
+
+#report_subject = [netdev-backup] Report
+#report_from = root@localhost
+#report_to = root@localhost
