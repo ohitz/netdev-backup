@@ -10,6 +10,7 @@ use File::Temp qw/ tempfile tempdir /;
 use Expect;
 use strict;
 
+my $cfg_help;
 my $cfg_debug;
 my $cfg_repository;
 my $cfg_hostsfile;
@@ -24,7 +25,8 @@ my $cfg_workdir;
 
 Getopt::Long::Configure("bundling");
 
-if (!GetOptions( "hosts|h=s" => \$cfg_hostsfile,
+if (!GetOptions( "help|?" => \$cfg_help,
+                 "hosts|h=s" => \$cfg_hostsfile,
                  "config|c=s" => \$cfg_configfile,
                  "message|m=s" => \$cfg_message,
                  "workdir|w=s" => \$cfg_workdir,
@@ -34,6 +36,10 @@ if (!GetOptions( "hosts|h=s" => \$cfg_hostsfile,
                  "no-store-hosts|H" => \$cfg_no_store_hosts,
                  "no-store-config|C" => \$cfg_no_store_config,
                  "no-commit|n" => \$cfg_no_commit )) {
+  usage();
+}
+
+if ($cfg_help) {
   usage();
 }
 

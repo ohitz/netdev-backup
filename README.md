@@ -4,13 +4,46 @@ netdev-backup
 Script which logs into your network devices (routers, switches etc.),
 downloads the current configuration and stores it in a git repository.
 
-config.cfg
-----------
+Installation and Usage
+----------------------
+
+In order to use netdev-backup, you first have to create a git
+repository which will hold your configuration backups:
+
+```
+git init --bare <path-to-repository>
+```
+
+Then, create config.cfg and hosts.cfg files and put these in the new
+repository as well.
+
+Now, you can call netdev-backup as follows:
+
+```
+netdev-backup <path-to-repository>
+```
+
+This command will do the following:
+
+- Clone into you repository.
+- Read your config.cfg and hosts.cfg.
+- Log into all the network devices defined in hosts.cfg to download
+  the configurations.
+- Commit all configurations to the repository.
+- Send an email with a report (if this is configured in config.cfg).
+
+It is also possible to specify the config.cfg and hosts.cfg files on
+the command line. In order to see a list of all command line switches,
+call netdev-backup without arguments or with _--help_.
+
+Configuration file: config.cfg
+------------------------------
 
 The config.cfg file is stored in the repository or specified on the
 command line.
 
-It contains one _key=value_ pair per line.
+It contains one _key=value_ pair per line. Content after # is ignored
+(comment).
 
 The following keys are supported:
 
@@ -19,8 +52,8 @@ The following keys are supported:
 - **report_to**: Recipient of the report email (comma-separated for
   multiple recipients
 
-hosts.cfg
----------
+List of network devices: hosts.cfg
+----------------------------------
 
 The hosts.cfg file stored in the repository or specified on the
 command line contains the list of network devices to log into. Every
