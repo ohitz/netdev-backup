@@ -1,0 +1,993 @@
+#!/usr/bin/perl
+#
+# Copyright (C) 2010-2014 Oliver Hitz <oliver@net-track.ch>
+#
+
+use Getopt::Long;
+use File::Basename;
+use File::Copy;
+use File::Temp qw/ tempfile tempdir /;
+use Expect;
+use strict;
+
+my $cfg_debug;
+my $cfg_repository;
+my $cfg_hostsfile;
+my $cfg_configfile;
+my $cfg_no_mail;
+my $cfg_report_always;
+my $cfg_no_store_hosts = 0;
+my $cfg_no_store_config = 0;
+my $cfg_no_commit = 0;
+my $cfg_message = "netdev-backup run ".localtime();
+my $cfg_workdir;
+
+Getopt::Long::Configure("bundling");
+
+if (!GetOptions( "hosts|h=s" => \$cfg_hostsfile,
+                 "config|c=s" => \$cfg_configfile,
+                 "message|m=s" => \$cfg_message,
+                 "workdir|w=s" => \$cfg_workdir,
+		 "debug|d" => \$cfg_debug,
+                 "no-mail|M" => \$cfg_no_mail,
+                 "report-always|f" => \$cfg_report_always,
+                 "no-store-hosts|H" => \$cfg_no_store_hosts,
+                 "no-store-config|C" => \$cfg_no_store_config,
+                 "no-commit|n" => \$cfg_no_commit )) {
+  usage();
+}
+
+# Various paths
+my $cfg_ssh = "/usr/bin/ssh -o HashKnownHosts=no -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no";
+my $cfg_telnet = "/usr/bin/telnet";
+my $cfg_git = "/usr/bin/git";
+my $cfg_sendmail = "/usr/sbin/sendmail";
+
+# Report stuff
+my $report_errors = "";
+my $report_summary = "";
+my $report_details = "";
+
+# If debugging is on, log all Expect stuff to stdout.
+if ($cfg_debug) {
+  $Expect::Log_Stdout = 1;
+} else {
+  $Expect::Log_Stdout = 0;
+}
+
+if ($#ARGV < 0) {
+  usage();
+}
+
+$cfg_repository = shift @ARGV;
+
+#
+# Prepare work environment
+#
+if ($cfg_workdir) {
+  # Ensure workdir doesn't exist.
+  if (-e $cfg_workdir) {
+    fail("Work directory '%s' already exists.\n", $cfg_workdir);
+  }
+} else {
+  # Create temporary directory.
+  $cfg_workdir = tempdir( CLEANUP => 1 );
+  debug("Temporary workdir created at $cfg_workdir\n");
+}
+
+my $rc = system($cfg_git, "clone", "-q", $cfg_repository, $cfg_workdir);
+if (0 != $rc >> 8) {
+  fail("git clone failed with status %d.\n", $rc >> 8);
+}
+
+# Set push.default to simple
+my $rc = system($cfg_git, "-C", $cfg_workdir, "config", "push.default", "simple");
+if (0 != $rc >> 8) {
+  fail("git config failed with status %d.\n", $rc >> 8);
+}
+
+#
+# Load configuration
+#
+my $cfg_report_subject = "[netdev-backup] Report";
+my $cfg_report_from;
+my $cfg_report_to;
+
+if ($cfg_configfile) {
+  # Hosts file defined on the command line.
+  if (!open(CONFIG, $cfg_configfile)) {
+    fail("Cannot open $cfg_configfile for reading.\n");
+  }
+
+  if (!$cfg_no_store_config) {
+    # Copy file to repository.
+    copy($cfg_configfile, "$cfg_workdir/config.cfg");
+    system($cfg_git, "-C", $cfg_workdir, "add", "config.cfg");
+  }
+} else {
+  # Configuration file contained in the repository.
+  if (!open(CONFIG, "$cfg_workdir/config.cfg")) {
+    fail("Cannot open config.cfg.\n");
+  }
+  $cfg_configfile = "config.cfg";
+}
+
+my $linenum = 0;
+while (my $line = <CONFIG>) {
+  $linenum++;
+  
+  # Strip comments
+  $line =~ s/#.*//;
+
+  if ($line =~ /^\s*([^=\s]*)\s*=\s*(.*)\s*$/) {
+    my ($k, $v) = ($1, $2);
+
+    if ($k eq "report_subject") {
+      $cfg_report_subject = $v;
+    } elsif ($k eq "report_from") {
+      $cfg_report_from = $v;
+    } elsif ($k eq "report_to") {
+      $cfg_report_to = $v;
+    } else {
+      fail("Error in $cfg_configfile:$linenum: key '%s' unknown.\n", $k, $v);
+    }
+  }
+}
+close(CONFIG);
+
+#
+# Load hosts
+#
+my $cfg_defined_hosts = {};
+
+if ($cfg_hostsfile) {
+  # Hosts file defined on the command line.
+  if (!open(HOSTS, $cfg_hostsfile)) {
+    fail("Cannot open $cfg_hostsfile for reading.\n");
+  }
+
+  if (!$cfg_no_store_hosts) {
+    # Copy file to repository.
+    copy($cfg_hostsfile, "$cfg_workdir/hosts.cfg");
+    system($cfg_git, "-C", $cfg_workdir, "add", "hosts.cfg");
+  }
+} else {
+  # Hosts file contained in the repository.
+  if (!open(HOSTS, "$cfg_workdir/hosts.cfg")) {
+    fail("Cannot open hosts.cfg.\n");
+  }
+  $cfg_hostsfile = "hosts.cfg";
+}
+
+my $linenum = 0;
+while (my $line = <HOSTS>) {
+  $linenum++;
+  
+  # Strip comments
+  $line =~ s/#.*//;
+  
+  my $host = parse_host($line);
+  if (ref $host) {
+    $cfg_defined_hosts->{$host->{name}.".".$host->{ip}} = $host;
+  } elsif ($host ne "") {
+    fail("Error in $cfg_hostsfile:$linenum: %s\n", $host);
+  }
+}
+close(HOSTS);
+
+#
+# If hosts are specified, only operate on these.
+#
+my $cfg_selected_hosts = {};
+
+if ($#ARGV < 0) {
+  # All hosts.
+  $cfg_selected_hosts = $cfg_defined_hosts;
+} else {
+  foreach my $name (@ARGV) {
+
+    my $found = 0;
+    
+    foreach my $name_ip (keys %{ $cfg_defined_hosts }) {
+      if ($name_ip =~ /^$name./) {
+        $cfg_selected_hosts->{$name_ip} = $cfg_defined_hosts->{$name_ip};
+        $found = 1;
+        last;
+      }
+    }
+
+    if (!$found) {
+      fail("Host $name not defined.\n");
+    }
+  }
+}
+
+#
+# Process selected hosts
+#
+foreach my $name_ip (keys %{ $cfg_selected_hosts }) {
+  my $host = $cfg_selected_hosts->{$name_ip};
+
+  debug("Processing %s/%s...\n", $host->{name}, $host->{ip});
+
+  my $c = device_connect($host);
+  if ($c) {
+    my $data;
+
+    if ($host->{type} =~ /^ciscosg/i) {
+      $data = get_ciscosg($c, $host);
+    } elsif ($host->{type} =~ /^cisco/i) {
+      $data = get_ciscoios($c, $host);
+    } elsif ($host->{type} =~ /^iosxr/i) {
+      $data = get_ciscoiosxr($c, $host);
+    } elsif ($host->{type} =~ /^pix/i) {
+      $data = get_ciscopix($c, $host);
+    } elsif ($host->{type} =~ /^foundry/i) {
+      $data = get_foundry($c, $host);
+    } elsif ($host->{type} =~ /^hp/i) {
+      $data = get_hpprocurve($c, $host);
+    } else {
+      my $msg = sprintf("Unknown device type %s (%s).\n", $host->{type}, $host->{name});
+      $report_errors .= $msg;
+      failmsg($msg);
+    }
+
+    if ($data) {
+      save_data($host, $data);
+    }
+
+    $c->hard_close();
+  } else {
+    my $msg = sprintf("Unable to connect to %s (%s)\n", $host->{name}, $host->{ip});
+    $report_errors .= $msg;
+    failmsg($msg);
+  }
+
+}
+
+if (!$cfg_no_commit) {
+  system($cfg_git, "-C", $cfg_workdir, "commit", "-q", "-m", $cfg_message);
+  system($cfg_git, "-C", $cfg_workdir, "push", "-q");
+}
+
+#
+# Reporting
+#
+my $report = "";
+
+if ($report_errors ne "") {
+  $report .= "Errors:\n\n$report_errors\n";
+}
+if ($report_summary ne "") {
+  $report .= "Changes in:\n\n$report_summary\n";
+}
+if ($report_summary ne "") {
+  $report .= "Detailed changes:\n\n$report_details";
+}
+
+if (!send_report($report)) {
+  if ($report eq "") {
+    print "No changes!\n";
+  } else {
+    print $report;
+  }
+}
+
+exit 0;
+
+sub send_report
+{
+  my $report = shift;
+
+  if ($cfg_report_from eq "") {
+    return 0;
+  }
+  if ($cfg_report_to eq "") {
+    return 0;
+  }
+  if ($cfg_no_mail) {
+    return 0;
+  }
+
+  if ($report eq "") {
+    if (!$cfg_report_always) {
+      return 1;
+    }
+    $report = "\nNo changes!\n";
+  }
+
+  open(MAIL, sprintf("|%s -oi %s", $cfg_sendmail, $cfg_report_to));
+  print MAIL "From: $cfg_report_from\n";
+  print MAIL "To: $cfg_report_to\n";
+  print MAIL "Subject: $cfg_report_subject\n\n";
+  print MAIL $report;
+  close MAIL;
+
+  return 1;
+}
+
+sub usage
+{
+  fail(<<"EOT"
+Usage: $0 [options] repository [host1 .. hostN]
+
+Options:
+
+-d, --debug
+
+    Enable debugging output.
+
+-c, --config=CONFIG
+
+    Load configuration from the specified file rather than from the
+    config.cfg file contained in the repository.
+
+-h, --hosts=HOSTS
+
+    Load the list of hosts from the specified file rather than from
+    hosts.cfg file contained in the repository.
+
+-m, --message=MESSAGE
+
+    Specify commit message.
+
+-w, --workdir=DIRECTORY
+
+    Create the specified work directory rather than a temporary
+    directory. The directory will be created by the program, it
+    mustn't exist before starting the program.
+
+-M, --no-mail
+
+    By default, if report_from and report_to are configured, and
+    if changes were detected or errors occurred, an email with
+    a report is sent. With this switch, the report will be printed
+    to standard output.
+
+-f, --report-always
+
+    If no errors occurred and no changes were found, no email
+    report is sent. Using this switch will force a report to be
+    sent.
+
+-H, --no-store-hosts
+
+    Don't store the list of hosts in the repository. No effect if no
+    HOSTS file is specified on the command line.
+
+-C, --no-store-config
+
+    Don't store the configuration in the repository. No effect if no
+    CONFIG file is specified on the command line.
+
+-n, --no-commit
+
+    Download the configurations but don't commit any changes to the
+    repository.
+
+EOT
+);      
+}
+
+sub fail
+{
+  my $format = shift;
+  my (@args) = @_;
+
+  printf STDERR ($format, @args);
+  exit 1;
+}
+
+sub failmsg
+{
+  my $format = shift;
+  my (@args) = @_;
+
+  printf STDERR ($format, @args);
+}
+
+sub debug
+{
+  my $format = shift;
+  my (@args) = @_;
+
+  if ($cfg_debug) {
+    printf($format, @args);
+  }
+}
+
+# ------------------------------------------------------------------
+# Connect to a router using ssh or telnet.
+#
+sub device_connect
+{
+  my ($host) = @_;
+  my $cmd;
+  my $auth_ok = 0;
+  my $user_sent = 0;
+  my $pass_sent = 0;
+
+  my $ip = $host->{ip};
+  my $port = 0;
+  if ($host->{backup_ip} ne "") {
+    $ip = $host->{backup_ip};
+    $port = $host->{backup_port};
+  }
+
+  # Construct user@host for ssh
+  my $user_host = $ip;
+  if ($host->{user} ne "") {
+    $user_host = sprintf("%s\@%s", $host->{user}, $ip);
+  } else {
+    $user_host = $ip;
+  }
+
+  if ($port == 0) {
+    if ($host->{protocol} eq "ssh") {
+      $cmd = sprintf("exec %s %s", $cfg_ssh, $user_host);
+    } elsif ($host->{protocol} eq "ssh-des") {
+      $cmd = sprintf("exec %s -c des %s", $cfg_ssh, $user_host);
+    } elsif ($host->{protocol} eq "ssh-3des") {
+      $cmd = sprintf("exec %s -c 3des %s", $cfg_ssh, $user_host);
+    } elsif ($host->{protocol} eq "telnet") {
+      $cmd = sprintf("exec %s %s", $cfg_telnet, $host->{ip});
+    } else {
+      print STDERR "Unknown protocol '".$host->{protocol}."'.\n";
+      return undef;
+    }
+  } else {
+    if ($host->{protocol} eq "ssh") {
+      $cmd = sprintf("exec %s -p %s %s", $cfg_ssh, $port, $user_host);
+    } elsif ($host->{protocol} eq "ssh-des") {
+      $cmd = sprintf("exec %s -c des -p %s %s", $cfg_ssh, $port, $user_host);
+    } elsif ($host->{protocol} eq "ssh-3des") {
+      $cmd = sprintf("exec %s -c 3des -p %s %s", $cfg_ssh, $port, $user_host);
+    } elsif ($host->{protocol} eq "telnet") {
+      $cmd = sprintf("exec %s %s %s", $cfg_telnet, $ip, $port);
+    } else {
+      print STDERR "Unknown protocol '".$host->{protocol}."'.\n";
+      return undef;
+    }
+  }
+
+  my $c = new Expect;
+  $c->raw_pty(1);
+  if ($c->spawn($cmd)) {
+    if (device_login($c, $host)) {
+      return $c;
+    }
+    $c->hard_close();
+  }
+
+  return undef;
+}
+
+# ------------------------------------------------------------------
+# Do the initial login dialog.
+#
+sub device_login
+{
+  my ($c, $host) = @_;
+
+  my $auth_ok = undef;
+  my $user_sent = undef;
+  my $pass_sent = undef;
+
+  my $eof = undef;
+  my $timeout = undef;
+
+  $c->expect(10,
+	     [ 'continue connecting \(yes/no\)\? ',
+	       sub { my ($exp) = @_;
+		     $exp->send("yes\r");
+		     exp_continue; } ],
+	     [ qr/ress any key to continue/,
+	       sub { my ($exp) = @_;
+	             $exp->send("\r");
+		     exp_continue; } ],
+	     [ qr/refused./,
+	       sub { } ],
+	     [ qr/assword: ?/,
+	       sub { my ($exp, $pass) = @_;
+		     if (!$pass_sent) {
+		       $exp->send($pass."\r");
+		       $pass_sent = 1;
+		       exp_continue;
+		     } },
+	       $host->{password} ],
+	     [ qr/sername: /,
+	       sub { my ($exp, $user) = @_;
+		     if (!$user_sent) {
+		       $exp->send($user."\r");
+		       $user_sent = 1;
+		       exp_continue;
+		     } },
+	       $host->{user} ],
+	     [ qr/User Name:/,
+	       sub { my ($exp, $user) = @_;
+		     if (!$user_sent) {
+		       $exp->send($user."\r");
+		       $user_sent = 1;
+		       exp_continue;
+		     } },
+	       $host->{user} ],
+	     [ qr/> ?/,
+	       sub { my ($exp) = @_;
+		     $exp->send("enable\r");
+                     $pass_sent = undef;
+		     exp_continue; } ],
+	     [ qr/^[^ ]+# ?/m,
+	       sub { my ($exp, $host) = @_;
+                     my $m = $exp->exp_match();
+                     if (contains_vt100esc($m)) {
+                       $m = strip_vt100esc($m);
+                     }
+                     $m =~ /(\S+)#\s*/;
+                     $m = $1;
+                     $host->{prompt} = $m;
+		     $auth_ok = 1; }, $host ],
+	     [ 'timeout',
+	       sub { $timeout = 1; } ],
+	     [ 'eof',
+	       sub { $eof = 1; } ],
+	    );
+
+  return $auth_ok;
+}
+
+# ------------------------------------------------------------------
+# Save data file.
+#
+sub save_data
+{
+  my ($host, $data) = @_;
+
+  my $filename = sprintf("%s_%s", $host->{name}, $host->{ip});
+  
+  if (open(DATA, "> $cfg_workdir/$filename")) {
+    print DATA $data;
+    close DATA;
+
+    system($cfg_git, "-C", $cfg_workdir, "add", $filename);
+
+    if (open(DIFF, sprintf("%s -C %s diff --staged -p -u %s 2>&1 |", $cfg_git, $cfg_workdir, $filename))) {
+      my $details = "";
+      while (my $l = <DIFF>) {
+        $details .= $l;
+      }
+      close DIFF;
+
+      if ($details ne "") {
+        $report_summary .= sprintf("  %s (%s)\n", $host->{name}, $host->{ip});
+        $report_details .= $details;
+        $report_details .= "\n";
+      }
+    }
+  } else {
+    failmsg("Unable to create $filename.");
+  }
+}
+
+# ------------------------------------------------------------------
+# Get data from Cisco IOS box.
+#
+sub get_ciscoios
+{
+  my ($c, $host) = @_;
+
+  my $result = "";
+
+  device_send_command($c, $host, "terminal length 0\r");
+
+  my ($err, $tmp) = device_send_command($c, $host, "show version\r");
+  if ($err) {
+    return undef;
+  }
+
+  $tmp =~ s/^.*uptime is.*$//m;
+  $tmp =~ s/^System restarted .*$//m;
+  $tmp =~ s/^Uptime for this control processor is.*$//m;
+
+  $result .= $tmp."\n";
+
+  ($err, $tmp) = device_send_command($c, $host, "dir all-filesystems\r");
+  if ($err) {
+    return undef;
+  }
+
+  $tmp =~ s/\d+ bytes total.*$//gm;
+
+  $result .= $tmp."\n";
+
+  # Prepend every line with "!"
+  $result =~ s/^/! /gm;
+
+  ($err, $tmp) = device_send_command($c, $host, "show running-config\r");
+  if ($err) {
+    return undef;
+  }
+
+  $tmp =~ s/^\! Last configuration change at.*$//m;
+  $tmp =~ s/^\! NVRAM config last updated at.*$//m;
+  $tmp =~ s/^ntp clock-period.*$//m;
+
+  $result .= $tmp."\n";
+
+  $c->clear_accum();
+  $c->send("exit\r");
+
+  return $result;
+}
+
+# ------------------------------------------------------------------
+# Get data from Cisco SG.
+#
+sub get_ciscosg
+{
+  my ($c, $host) = @_;
+
+  my $result = "";
+
+  device_send_command($c, $host, "terminal datadump\r");
+
+  my ($err, $tmp) = device_send_command($c, $host, "show version\r");
+  if ($err) {
+    return undef;
+  }
+
+  $tmp =~ s/^.*uptime is.*$//m;
+  $tmp =~ s/^System restarted .*$//m;
+  $tmp =~ s/^Uptime for this control processor is.*$//m;
+
+  $result .= $tmp."\n";
+
+  ($err, $tmp) = device_send_command($c, $host, "dir\r");
+  if ($err) {
+    return undef;
+  }
+
+  $tmp =~ s/\d+ bytes total.*$//gm;
+
+  $result .= $tmp."\n";
+
+  # Prepend every line with "!"
+  $result =~ s/^/! /gm;
+
+  ($err, $tmp) = device_send_command($c, $host, "show running-config detailed\r");
+  if ($err) {
+    return undef;
+  }
+
+  $result .= $tmp."\n";
+
+  $result =~ s/\r//g;
+
+  $c->clear_accum();
+  $c->send("exit\r");
+
+  return $result;
+}
+
+# ------------------------------------------------------------------
+# Get data from Cisco IOS XR box.
+#
+sub get_ciscoiosxr
+{
+  my ($c, $host) = @_;
+
+  my $result = "";
+
+  device_send_command($c, $host, "terminal length 0\r");
+  device_send_command($c, $host, "terminal exec prompt no-timestamp\r");
+
+  my ($err, $tmp) = device_send_command($c, $host, "show version\r");
+  if ($err) {
+    return undef;
+  }
+
+  $tmp =~ s/^.*uptime is.*$//m;
+  $tmp =~ s/^System restarted .*$//m;
+  $tmp =~ s/^Uptime for this control processor is.*$//m;
+
+  $result .= $tmp."\n";
+
+  ($err, $tmp) = device_send_command($c, $host, "dir all-filesystems\r");
+  if ($err) {
+    return undef;
+  }
+
+  $result .= $tmp."\n";
+
+  # Prepend every line with "!"
+  $result =~ s/^/! /gm;
+
+  ($err, $tmp) = device_send_command($c, $host, "show running-config\r");
+  if ($err) {
+    return undef;
+  }
+
+  $tmp =~ s/^\! Last configuration change at.*$//m;
+  $tmp =~ s/^\! NVRAM config last updated at.*$//m;
+  $tmp =~ s/^ntp clock-period.*$//m;
+
+  $result .= $tmp."\n";
+
+  $c->clear_accum();
+  $c->send("exit\r");
+
+  return $result;
+}
+
+# ------------------------------------------------------------------
+# Get data from Cisco PIX.
+#
+sub get_ciscopix
+{
+  my ($c, $host) = @_;
+
+  my $result = "";
+
+  my $config = "";
+  my $version = "";
+
+  my ($err, $tmp) = device_send_command($c, $host, "show version\r");
+  if ($err) {
+    return undef;
+  }
+
+  # Filter options that always change
+  $tmp =~ s/^\w+ up \d+.*$//m;
+  $tmp =~ s/^Configuration last modified by.*$//m;
+
+  $result .= $tmp."\n";
+
+  ($err, $tmp) = device_send_command($c, $host, "show flash\r");
+  if ($err) {
+    return undef;
+  }
+
+  $result .= $tmp."\n";
+
+  # Prepend every line with "!"
+  $result =~ s/^/! /gm;
+
+  ($err, $tmp) = device_send_command($c, $host, "show running-config\r");
+  if ($err) {
+    return undef;
+  }
+
+  $result .= $tmp."\n";
+
+  $c->clear_accum();
+  $c->send("exit\r");
+
+  return $result;
+}
+
+# ------------------------------------------------------------------
+# Get data from HP Procurve switch
+#
+sub get_hpprocurve
+{
+  my ($c, $host) = @_;
+
+  my $result = "";
+
+  my ($err, $tmp) = device_send_command($c, $host, "no page\n");
+  if ($err) {
+    return undef;
+  }
+
+  ($err, $tmp) = device_send_command($c, $host, "show version\n");
+  if ($err) {
+    return undef;
+  }
+
+  $tmp =~ s/\r//g;
+  $result .= strip_vt100esc($tmp)."\n";
+
+  # Prepend every line with "!"
+  $result =~ s/^/! /gm;
+
+  ($err, $tmp) = device_send_command($c, $host, "show running-config\n");
+  if ($err) {
+    return undef;
+  }
+
+  $result .= strip_vt100esc($tmp)."\n";
+
+  $result =~ s/\r//g;
+
+  $c->clear_accum();
+  $c->send("logout\r");
+  $c->send("y\r");
+
+  return ($result);
+}
+
+
+# ------------------------------------------------------------------
+# Get data from a Foundry box.
+#
+sub get_foundry
+{
+  my ($c, $host) = @_;
+
+  my $result = "";
+
+  my ($err, $tmp) = device_send_command($c, $host, "skip-page-display\r");
+  if ($err) {
+    return undef;
+  }
+
+  ($err, $tmp) = device_send_command($c, $host, "show version\r");
+  if ($err) {
+    return undef;
+  }
+
+  $tmp =~ s/^.*[Ss]ystem uptime is.*$//gm;
+  $tmp =~ s/^The system uptime is .*$//m;
+  $tmp =~ s/^The system started at .*$//m;
+
+  $result .= $tmp."\n";
+
+  ($err, $tmp) = device_send_command($c, $host, "show flash\r");
+  if ($err) {
+    return undef;
+  }
+
+  $tmp =~ s/^\s*code flash free space =.*$//gim;
+
+  $result .= $tmp."\n";
+
+  # Prepend every line with "!"
+  $result =~ s/^/! /gm;
+
+  ($err, $tmp) = device_send_command($c, $host, "show running-config\r");
+  if ($err) {
+    return undef;
+  }
+
+  $result .= $tmp."\n";
+
+  $c->clear_accum();
+  $c->send("exit\r");
+
+  return $result;
+}
+# ------------------------------------------------------------------
+# Send command
+#
+sub device_send_command
+{
+  my ($c, $host, $cmd) = @_;
+
+  my $result = undef;
+  my $eof = undef;
+  my $timeout = undef;
+
+  my $prompt = $host->{prompt};
+
+  $c->clear_accum();
+  $c->send($cmd);
+  $c->expect(30,
+	     [ qr/$cmd\n?/,
+	       sub { exp_continue; } ],
+             [ qr/$prompt[#>] ?/m,
+	       sub { my ($exp) = @_;
+#	             print "< 2\n".hdump($exp->exp_match())."\n";
+		     $result = $exp->exp_before(); } ],
+	     [ 'eof',
+	       sub { $eof = 1; } ],
+	     [ 'timeout',
+	       sub { $timeout = 1; } ]);
+
+  if ($eof || $timeout) {
+    return (1, undef);
+  } else {
+    return (0, $result);
+  }
+}
+
+# ------------------------------------------------------------------
+# Parse a line from the configuration file.
+#
+sub parse_host
+{
+  my ($l) = @_;
+
+  my %host = ( name        => "",
+               ip          => "",
+	       user        => "",
+	       password    => "",
+	       enable      => "",
+	       type        => "ios",
+	       protocol    => "ssh",
+	       backup_ip   => "",
+	       backup_port => "",
+               prompt      => "" );
+
+  $l =~ s/#.*//;
+  $l =~ s/^\s*//;
+  $l =~ s/\s*$//;
+
+  if ($l eq "") {
+    return undef;
+  }
+
+  my @spec = split(/,/, $l);
+
+  foreach my $t (@spec) {
+    $t =~ s/^\s*//;
+    $t =~ s/\s*$//;
+
+    if ($t =~ /^([^=]*)=(.*)$/) {
+      my ($k, $v) = ($1, $2);
+      if ($k eq "name") {
+	$host{name} = $v;
+      } elsif ($k eq "ip") {
+	$host{ip} = $v;
+      } elsif ($k eq "user") {
+	$host{user} = $v;
+      } elsif ($k eq "password") {
+	$host{password} = $v;
+      } elsif ($k eq "enable") {
+	$host{enable} = $v;
+      } elsif ($k eq "type") {
+	$host{type} = $v;
+      } elsif ($k eq "protocol") {
+	$host{protocol} = $v;
+      } elsif ($k eq "backup_ip") {
+	$host{backup_ip} = $v;
+      } elsif ($k eq "backup_port") {
+	$host{backup_port} = $v;
+      } else {
+	return "Unknown key '$k'";
+      }
+    } else {
+      return "Unknown token '$t'";
+    }
+  }
+  return \%host;
+}
+
+
+sub hdump {
+    my $offset = 0;
+    my(@array,$format);
+    foreach my $data (unpack("a16"x(length($_[0])/16)."a*",$_[0])) {
+        my($len)=length($data);
+        if ($len == 16) {
+            @array = unpack('N4', $data);
+            $format="0x%08x (%05d)   %08x %08x %08x %08x   %s\n";
+        } else {
+            @array = unpack('C*', $data);
+            $_ = sprintf "%2.2x", $_ for @array;
+            push(@array, '  ') while $len++ < 16;
+            $format="0x%08x (%05d)" .
+               "   %s%s%s%s %s%s%s%s %s%s%s%s %s%s%s%s   %s\n";
+        } 
+        $data =~ tr/\0-\37\177-\377/./;
+        printf $format,$offset,$offset,@array,$data;
+        $offset += 16;
+    }
+}
+
+sub strip_vt100esc
+{
+  my ($in) = @_;
+
+  $in =~ s/\e\[\d+;\d+[Hr]//gm;
+  $in =~ s/\e\[\?\d+[hl]//gm;
+  $in =~ s/\e\[\d+[KM]//gm;
+  $in =~ s/\eE/\n/gm;
+  $in =~ s/\e\[1L/\n/gm;
+
+  return $in;
+}
+
+sub contains_vt100esc
+{
+  my ($in) = @_;
+  return $in =~ /\e\[/;
+}
