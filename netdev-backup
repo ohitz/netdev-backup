@@ -5,6 +5,7 @@
 
 use Getopt::Long;
 use File::Basename;
+use File::chdir;
 use File::Copy;
 use File::Temp qw/ tempfile tempdir /;
 use Expect;
@@ -86,12 +87,6 @@ if (0 != $rc >> 8) {
   fail("git clone failed with status %d.\n", $rc >> 8);
 }
 
-# Set push.default to simple
-my $rc = system($cfg_git, "-C", $cfg_workdir, "config", "push.default", "simple");
-if (0 != $rc >> 8) {
-  fail("git config failed with status %d.\n", $rc >> 8);
-}
-
 #
 # Load configuration
 #
@@ -108,7 +103,10 @@ if ($cfg_configfile) {
   if (!$cfg_no_store_config) {
     # Copy file to repository.
     copy($cfg_configfile, "$cfg_workdir/config.cfg");
-    system($cfg_git, "-C", $cfg_workdir, "add", "config.cfg");
+    my $oldcwd = $CWD;
+    $CWD = $cfg_workdir;
+    system($cfg_git, "add", "config.cfg");
+    $CWD = $oldcwd;
   }
 } else {
   # Configuration file contained in the repository.
@@ -155,7 +153,10 @@ if ($cfg_hostsfile) {
   if (!$cfg_no_store_hosts) {
     # Copy file to repository.
     copy($cfg_hostsfile, "$cfg_workdir/hosts.cfg");
-    system($cfg_git, "-C", $cfg_workdir, "add", "hosts.cfg");
+    my $oldcwd = $CWD;
+    $CWD = $cfg_workdir;
+    system($cfg_git, "add", "hosts.cfg");
+    $CWD = $oldcwd;
   }
 } else {
   # Hosts file contained in the repository.
@@ -252,8 +253,19 @@ foreach my $name_ip (keys %{ $cfg_selected_hosts }) {
 }
 
 if (!$cfg_no_commit) {
-  system($cfg_git, "-C", $cfg_workdir, "commit", "-q", "-m", $cfg_message);
-  system($cfg_git, "-C", $cfg_workdir, "push", "-q");
+  my $oldcwd = $CWD;
+  $CWD = $cfg_workdir;
+
+  # Set push.default to upstream
+  my $rc = system($cfg_git, "config", "push.default", "upstream");
+  if (0 != $rc >> 8) {
+    fail("git config failed with status %d.\n", $rc >> 8);
+  }
+
+  system($cfg_git, "commit", "-q", "-m", $cfg_message);
+  system($cfg_git, "push", "-q");
+
+  $CWD = $oldcwd;
 }
 
 #
@@ -456,6 +468,8 @@ sub device_connect
     }
   }
 
+  debug($cmd);
+
   my $c = new Expect;
   $c->raw_pty(1);
   if ($c->spawn($cmd)) {
@@ -554,9 +568,12 @@ sub save_data
     print DATA $data;
     close DATA;
 
-    system($cfg_git, "-C", $cfg_workdir, "add", $filename);
+    my $oldcwd = $CWD;
+    $CWD = $cfg_workdir;
 
-    if (open(DIFF, sprintf("%s -C %s diff --staged -p -u %s 2>&1 |", $cfg_git, $cfg_workdir, $filename))) {
+    system($cfg_git, "add", $filename);
+
+    if (open(DIFF, sprintf("%s diff --staged -p -u %s 2>&1 |", $cfg_git, $filename))) {
       my $details = "";
       while (my $l = <DIFF>) {
         $details .= $l;
@@ -569,6 +586,8 @@ sub save_data
         $report_details .= "\n";
       }
     }
+
+    $CWD = $oldcwd;
   } else {
     failmsg("Unable to create $filename.");
   }
