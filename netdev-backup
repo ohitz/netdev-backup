@@ -265,7 +265,7 @@ if (!$cfg_no_commit) {
   # Check if there are changes to commit
   my $no_changes = 1;
 
-  if (open(DIFF, sprintf("%s diff --shortstat 2> /dev/null |", $cfg_git))) {
+  if (open(DIFF, sprintf("%s diff --shortstat --staged 2> /dev/null |", $cfg_git))) {
     if (my $l = <DIFF>) {
       $no_changes = 0;
     }
