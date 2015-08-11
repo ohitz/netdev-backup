@@ -85,6 +85,8 @@ Supported device types:
 - **pix**: Cisco Pix firewalls
 - **foundry**: Foundry and Brocade switches
 - **hp**: HP Procurve switches
+- **mikrotik**: Mikrotik routers. Important append "+ct" to the username
+  to switch off the fancy colors and other terminal stuff.
 
 Supported protocols:
 

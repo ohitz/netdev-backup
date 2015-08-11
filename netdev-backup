@@ -233,6 +233,8 @@ foreach my $name_ip (keys %{ $cfg_selected_hosts }) {
       $data = get_foundry($c, $host);
     } elsif ($host->{type} =~ /^hp/i) {
       $data = get_hpprocurve($c, $host);
+    } elsif ($host->{type} =~ /^mikrotik/i) {
+      $data = get_mikrotik($c, $host);
     } else {
       my $msg = sprintf("Unknown device type %s (%s).\n", $host->{type}, $host->{name});
       $report_errors .= $msg;
@@ -544,10 +546,17 @@ sub device_login
 		     } },
 	       $host->{user} ],
 	     [ qr/> ?/,
-	       sub { my ($exp) = @_;
-		     $exp->send("enable\r");
-                     $pass_sent = undef;
-		     exp_continue; } ],
+	       sub { my ($exp, $host) = @_;
+                     if ($host->{type} eq 'mikrotik') {
+                       my $m = $exp->exp_before() . $exp->exp_match();
+                       $m =~ /\[([^[]*)\@([^[]*)\] > $/;
+                       $host->{prompt} = "\\[$1\@$2\\] ";
+                       $auth_ok = 1;
+                     } else {
+		       $exp->send("enable\r");
+                       $pass_sent = undef;
+		       exp_continue;
+                     } }, $host ],
 	     [ qr/^[^ ]+# ?/m,
 	       sub { my ($exp, $host) = @_;
                      my $m = $exp->exp_match();
@@ -556,6 +565,57 @@ sub device_login
                      }
                      $m =~ /(\S+)#\s*/;
                      $m = $1;
+                     $host->{prompt} = $m;
+		     $auth_ok = 1; }, $host ],
+	     [ 'timeout',
+	       sub { $timeout = 1; } ],
+	     [ 'eof',
+	       sub { $eof = 1; } ],
+	    );
+
+  return $auth_ok;
+}
+
+# ------------------------------------------------------------------
+# Do the initial login dialog.
+#
+sub device_login_mikrotik
+{
+  my ($c, $host) = @_;
+
+  my $auth_ok = undef;
+  my $user_sent = undef;
+  my $pass_sent = undef;
+
+  my $eof = undef;
+  my $timeout = undef;
+
+  $c->expect(10,
+	     [ 'continue connecting \(yes/no\)\? ',
+	       sub { my ($exp) = @_;
+		     $exp->send("yes\r");
+		     exp_continue; } ],
+	     [ qr/ress any key to continue/,
+	       sub { my ($exp) = @_;
+	             $exp->send("\r");
+		     exp_continue; } ],
+	     [ qr/refused./,
+	       sub { } ],
+	     [ qr/assword: ?/,
+	       sub { my ($exp, $pass) = @_;
+		     if (!$pass_sent) {
+		       $exp->send($pass."\r");
+		       $pass_sent = 1;
+		       exp_continue;
+		     } },
+	       $host->{password} ],
+	     [ qr/\[.*\@.*\] > /m,
+	       sub { my ($exp, $host) = @_;
+                     my $m = $exp->exp_match();
+                     $m =~ /(\S+ )> /;
+                     $m = $1;
+                     $m =~ s/\[/\\\[/;
+                     $m =~ s/\]/\\\]/;
                      $host->{prompt} = $m;
 		     $auth_ok = 1; }, $host ],
 	     [ 'timeout',
@@ -892,6 +952,31 @@ sub get_foundry
 
   return $result;
 }
+
+# ------------------------------------------------------------------
+# Get data from a Mikrotik router.
+#
+sub get_mikrotik
+{
+  my ($c, $host) = @_;
+
+  my $result = "";
+
+  my ($err, $tmp) = device_send_command($c, $host, "/export\r");
+  if ($err) {
+    return undef;
+  }
+
+  $tmp =~ s/(# ).*( by RouterOS.*)$/$1$2/m;
+
+  $result .= $tmp."\n";
+
+  $c->clear_accum();
+  $c->send("quit\r");
+
+  return $result;
+}
+
 # ------------------------------------------------------------------
 # Send command
 #
