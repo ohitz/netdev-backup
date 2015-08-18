@@ -577,57 +577,6 @@ sub device_login
 }
 
 # ------------------------------------------------------------------
-# Do the initial login dialog.
-#
-sub device_login_mikrotik
-{
-  my ($c, $host) = @_;
-
-  my $auth_ok = undef;
-  my $user_sent = undef;
-  my $pass_sent = undef;
-
-  my $eof = undef;
-  my $timeout = undef;
-
-  $c->expect(10,
-	     [ 'continue connecting \(yes/no\)\? ',
-	       sub { my ($exp) = @_;
-		     $exp->send("yes\r");
-		     exp_continue; } ],
-	     [ qr/ress any key to continue/,
-	       sub { my ($exp) = @_;
-	             $exp->send("\r");
-		     exp_continue; } ],
-	     [ qr/refused./,
-	       sub { } ],
-	     [ qr/assword: ?/,
-	       sub { my ($exp, $pass) = @_;
-		     if (!$pass_sent) {
-		       $exp->send($pass."\r");
-		       $pass_sent = 1;
-		       exp_continue;
-		     } },
-	       $host->{password} ],
-	     [ qr/\[.*\@.*\] > /m,
-	       sub { my ($exp, $host) = @_;
-                     my $m = $exp->exp_match();
-                     $m =~ /(\S+ )> /;
-                     $m = $1;
-                     $m =~ s/\[/\\\[/;
-                     $m =~ s/\]/\\\]/;
-                     $host->{prompt} = $m;
-		     $auth_ok = 1; }, $host ],
-	     [ 'timeout',
-	       sub { $timeout = 1; } ],
-	     [ 'eof',
-	       sub { $eof = 1; } ],
-	    );
-
-  return $auth_ok;
-}
-
-# ------------------------------------------------------------------
 # Save data file.
 #
 sub save_data
