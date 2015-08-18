@@ -78,7 +78,7 @@ if ($cfg_workdir) {
   }
 } else {
   # Create temporary directory.
-  $cfg_workdir = tempdir( CLEANUP => 1 );
+  $cfg_workdir = tempdir( "netdevXXXXXX", CLEANUP => 1 );
   debug("Temporary workdir created at $cfg_workdir\n");
 }
 
