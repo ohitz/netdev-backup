@@ -916,8 +916,12 @@ sub get_mikrotik
     return undef;
   }
 
-  $tmp =~ s/(# ).*( by RouterOS.*)$/$1$2/m;
+  $tmp =~ s/^\r//;
+  $tmp =~ s/(# ).*(RouterOS.*)$/$1$2/m;
 
+  # Remove warnings about VRRP packets with wrong version.
+  $tmp =~ s/\r\n# received packet from.*bad version.*\r\n/\r\n/g;
+  
   $result .= $tmp."\n";
 
   $c->clear_accum();
