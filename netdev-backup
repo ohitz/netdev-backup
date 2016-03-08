@@ -945,7 +945,7 @@ sub device_send_command
 
   $c->clear_accum();
   $c->send($cmd);
-  $c->expect(30,
+  $c->expect($host->{timeout},
 	     [ qr/$cmd\n?/,
 	       sub { exp_continue; } ],
              [ qr/$prompt[#>] ?/m,
@@ -980,7 +980,8 @@ sub parse_host
 	       protocol    => "ssh",
 	       backup_ip   => "",
 	       backup_port => "",
-               prompt      => "" );
+               prompt      => "",
+	       timeout     => 30 );
 
   $l =~ s/#.*//;
   $l =~ s/^\s*//;
@@ -1016,6 +1017,8 @@ sub parse_host
 	$host{backup_ip} = $v;
       } elsif ($k eq "backup_port") {
 	$host{backup_port} = $v;
+      } elsif ($k eq "timeout") {
+	$host{timeout} = $v;
       } else {
 	return "Unknown key '$k'";
       }
