@@ -4,3 +4,6 @@
 name=core-router,ip=10.10.10.10,user=root,password=verysecret,type=cisco
 name=core-switch,ip=10.10.10.11,user=root,password=verysecret,type=cisco
 
+# Mikrotik: add "+ct" to the username in order to disable colors and other
+# control sequences.
+name=core-mt,ip=10.10.10.12,user=admin+ct,password=verysecret,type=mikrotik
