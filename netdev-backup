@@ -692,7 +692,12 @@ sub get_ciscosg
     return undef;
   }
 
-  $tmp =~ s/\d+ bytes total.*$//gm;
+  $result .= $tmp."\n";
+
+  ($err, $tmp) = device_send_command($c, $host, "show vlan\r");
+  if ($err) {
+    return undef;
+  }
 
   $result .= $tmp."\n";
 
