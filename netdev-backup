@@ -82,6 +82,7 @@ if ($cfg_workdir) {
   debug("Temporary workdir created at $cfg_workdir\n");
 }
 
+debug("Executing: $cfg_git clone -q $cfg_repository $cfg_workdir\n");
 my $rc = system($cfg_git, "clone", "-q", $cfg_repository, $cfg_workdir);
 if (0 != $rc >> 8) {
   fail("git clone failed with status %d.\n", $rc >> 8);
@@ -243,6 +244,10 @@ foreach my $name_ip (keys %{ $cfg_selected_hosts }) {
 
     if ($data) {
       save_data($host, $data);
+    } else {
+      my $msg = sprintf("No data received from %s.\n", $host->{name});
+      $report_errors .= $msg;
+      failmsg($msg);
     }
 
     $c->hard_close();
@@ -259,6 +264,7 @@ if (!$cfg_no_commit) {
   $CWD = $cfg_workdir;
 
   # Set push.default to upstream
+  debug("Executing: $cfg_git config push.default upstream\n");
   my $rc = system($cfg_git, "config", "push.default", "upstream");
   if (0 != $rc >> 8) {
     fail("git config failed with status %d.\n", $rc >> 8);
@@ -275,7 +281,9 @@ if (!$cfg_no_commit) {
   }
 
   if (!$no_changes) {
+    debug("Executing: $cfg_git commit -q -m $cfg_message\n");
     system($cfg_git, "commit", "-q", "-m", $cfg_message);
+    debug("Executing: $cfg_git push -q\n");
     system($cfg_git, "push", "-q");
   }
 
@@ -584,6 +592,8 @@ sub save_data
   my ($host, $data) = @_;
 
   my $filename = sprintf("%s_%s", $host->{name}, $host->{ip});
+
+  debug("Saving output to $cfg_workdir/$filename\n");
   
   if (open(DATA, "> $cfg_workdir/$filename")) {
     print DATA $data;
@@ -592,6 +602,7 @@ sub save_data
     my $oldcwd = $CWD;
     $CWD = $cfg_workdir;
 
+    debug("Executing: $cfg_git add $filename\n");
     system($cfg_git, "add", $filename);
 
     if (open(DIFF, sprintf("%s diff --staged -p -u %s 2>&1 |", $cfg_git, $filename))) {
@@ -704,7 +715,7 @@ sub get_ciscosg
   # Prepend every line with "!"
   $result =~ s/^/! /gm;
 
-  ($err, $tmp) = device_send_command($c, $host, "show running-config detailed\r");
+  ($err, $tmp) = device_send_command($c, $host, "show running-config\r");
   if ($err) {
     return undef;
   }
